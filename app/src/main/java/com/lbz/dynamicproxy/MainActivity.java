@@ -1,12 +1,16 @@
 package com.lbz.dynamicproxy;
 
 import android.os.Bundle;
+import android.view.View;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
 
 import com.lbz.dynamicproxy.annotation.BindView;
 import com.lbz.dynamicproxy.annotation.OnClick;
+import com.lbz.dynamicproxy.annotation.OnClick2;
+import com.lbz.dynamicproxy.annotation.OnLongClick;
 import com.lbz.dynamicproxy.net.CustomRetrofit;
 import com.lbz.dynamicproxy.net.WeatherService;
 import com.lbz.dynamicproxy.utils.InjectView;
@@ -34,6 +38,7 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
         InjectView.inject(this);
+        InjectView.injectEvent(this);
         initRetrofit();
     }
 
@@ -43,7 +48,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
 
-    @OnClick(R.id.http_get)
+    @OnClick({R.id.http_get})
     public void getClick() {
         Call call = weatherService.getWeather("110102", KEY);
         call.enqueue(callback);
@@ -76,4 +81,14 @@ public class MainActivity extends AppCompatActivity {
         }
     };
 
+    @OnClick2(value = {R.id.test_click})
+    public void testClick(View view) {
+        Toast.makeText(this, "testClick", Toast.LENGTH_SHORT).show();
+    }
+
+    @OnLongClick(value = {R.id.test_long_click})
+    public boolean testLongClick(View view) {
+        Toast.makeText(this, "testLongClick", Toast.LENGTH_SHORT).show();
+        return false;
+    }
 }
