@@ -160,7 +160,7 @@ APT全称为："Anotation Processor Tools"，意为注解处理器。顾名思�
    com.lbz.apt_processor.MyProcessor
    ```
 
-    4. 编写process方法
+   4. 编写process方法
 
 
 
@@ -466,6 +466,8 @@ class java.lang.String
 
 参考https://juejin.cn/post/6974018412158664734
 
+https://blog.csdn.net/lvkaixuan/article/details/119784291
+
 ### 静态代理
 
 #### 定义
@@ -481,7 +483,7 @@ class java.lang.String
 
 代理模式一般会有三个角色：
 
-![image-20220421194707010](/Users/laibinzhi/Library/Application Support/typora-user-images/image-20220421194707010.png)
+![image](https://s2.loli.net/2022/05/06/d9MvX2Zbl83FmLn.png)
 
 **抽象角色**：指代理角色和真实角色对外提供的公共方法，一般为一个接口
 
@@ -501,8 +503,8 @@ class java.lang.String
 1. 创建接口，定义目标列要完成的功能。
 2. 创建目标类实现接口。
 3. 创建InvocationHandler接口的实现类，在invoke方法中完成代理类的功能。
-    1. 调用目标方法
-    2. 增强功能
+   1. 调用目标方法
+   2. 增强功能
 4. 使用Proxy类的静态方法，创建代理对象，并把返回值转为接口类型。
 
 ```java
@@ -583,19 +585,247 @@ class Main {
 
 实际上， Proxy.newProxyInstance 会创建一个Class，与静态代理不同，这个Class不是由具体的.java源文件编译而来，即没有真正的文件，只是在内存中按照Class格式生成了一个Class。
 
-```java
-  String name = Massage.class.getName() + "$Proxy0";
-        //生成代理指定接口的Class数据
-        byte[] bytes = ProxyGenerator.generateProxyClass(name, new Class[]{Massage.class});
-        FileOutputStream fos = new FileOutputStream("lib/" + name + ".class");
-        fos.write(bytes);
-        fos.close();
-```
 
-然后可以在生成的文件中查看我们的代理类：
+
+#### 动态代理源码分析
+
+本文以jdk提供的Proxy作为分析，Android的实现和jdk的实现大同小异，差别最后再说。
 
 ```Java
-    static {
+  public static Object newProxyInstance(ClassLoader loader,
+                                          Class<?>[] interfaces,
+                                          InvocationHandler h)
+        throws IllegalArgumentException
+    {
+        Objects.requireNonNull(h);
+
+        final Class<?>[] intfs = interfaces.clone();
+    		//安全管理器.判断有没有创建代理的权限
+        final SecurityManager sm = System.getSecurityManager();
+        if (sm != null) {
+            checkProxyAccess(Reflection.getCallerClass(), loader, intfs);
+        }
+
+        /*
+         * 这是动态代理中最重要的方法，代理类就是从中得到的
+         */
+        Class<?> cl = getProxyClass0(loader, intfs);
+
+        /*
+         * 使用我们的InvocationHandler实现类来调用构造方法
+         */
+        try {
+            if (sm != null) {
+                checkNewProxyPermission(Reflection.getCallerClass(), cl);
+            }
+
+            final Constructor<?> cons = cl.getConstructor(constructorParams);
+            final InvocationHandler ih = h;
+            //判断代理类是否是被public修饰的，如果不是，设计代理类是可以通过反射访问到的
+            if (!Modifier.isPublic(cl.getModifiers())) {
+                AccessController.doPrivileged(new PrivilegedAction<Void>() {
+                    public Void run() {
+                        cons.setAccessible(true);
+                        return null;
+                    }
+                });
+            }
+            //创建代理类对象
+            return cons.newInstance(new Object[]{h});
+        } catch (IllegalAccessException|InstantiationException e) {
+            throw new InternalError(e.toString(), e);
+        } catch (InvocationTargetException e) {
+            Throwable t = e.getCause();
+            if (t instanceof RuntimeException) {
+                throw (RuntimeException) t;
+            } else {
+                throw new InternalError(t.toString(), t);
+            }
+        } catch (NoSuchMethodException e) {
+            throw new InternalError(e.toString(), e);
+        }
+    }
+```
+
+> 为什么动态代理需要传入classLoader?
+>
+> 1⃣️需要校验传入的接口是否可被当前的类加载器加载,假如无法加载，证明这个接口与类加载器不是同一个，按照双亲委派模型，那么类加载层次就被破坏了
+>
+> 2⃣️需要类加载器去根据生成的类的字节码去通过defineClass方法生成类的class文件，也就是说没有类加载的话是无法生成代理类的
+
+我们主要看一下怎么获取到代理类的
+
+```java
+ Class<?> cl = getProxyClass0(loader, intfs);
+```
+
+```java
+private static final WeakCache<ClassLoader, Class<?>[], Class<?>>
+        proxyClassCache = new WeakCache<>(new KeyFactory(), new ProxyClassFactory());
+```
+
+```Java
+private static Class<?> getProxyClass0(ClassLoader loader,
+                                           Class<?>... interfaces) {
+        if (interfaces.length > 65535) {
+            throw new IllegalArgumentException("interface limit exceeded");
+        }
+
+        // 通过缓存得到代理类，如果没有就通过ProxyClassFactory创建
+        return proxyClassCache.get(loader, interfaces);
+    }
+```
+
+接下来，我们看看ProxyClassFactory如何创建代理类
+
+```java
+    private static final class ProxyClassFactory
+        implements BiFunction<ClassLoader, Class<?>[], Class<?>>
+    {
+        // 代理类类名的前缀
+        private static final String proxyClassNamePrefix = "$Proxy";
+
+        // 代理类名字计数器 AtomicLong具有原子性
+        private static final AtomicLong nextUniqueNumber = new AtomicLong();
+
+        @Override
+        public Class<?> apply(ClassLoader loader, Class<?>[] interfaces) {
+
+            Map<Class<?>, Boolean> interfaceSet = new IdentityHashMap<>(interfaces.length);
+            for (Class<?> intf : interfaces) {
+                /*
+                 * 判断相同名字的接口是否是同一个Class对象
+                 */
+                Class<?> interfaceClass = null;
+                try {
+                    interfaceClass = Class.forName(intf.getName(), false, loader);
+                } catch (ClassNotFoundException e) {
+                }
+                if (interfaceClass != intf) {
+                    throw new IllegalArgumentException(
+                        intf + " is not visible from class loader");
+                }
+                /*
+                 * 判断相应接口是否是一个真正的接口
+                 */
+                if (!interfaceClass.isInterface()) {
+                    throw new IllegalArgumentException(
+                        interfaceClass.getName() + " is not an interface");
+                }
+                /*
+                 * 验证接口是否重复
+                 */
+                if (interfaceSet.put(interfaceClass, Boolean.TRUE) != null) {
+                    throw new IllegalArgumentException(
+                        "repeated interface: " + interfaceClass.getName());
+                }
+            }
+
+            String proxyPkg = null;     // 生成的代理类的包名
+            int accessFlags = Modifier.PUBLIC | Modifier.FINAL;
+
+            /*
+             * 验证所有非公共接口的包是否在同一个包
+             */
+            for (Class<?> intf : interfaces) {
+                int flags = intf.getModifiers();
+                if (!Modifier.isPublic(flags)) {
+                    accessFlags = Modifier.FINAL;
+                    String name = intf.getName();
+                    int n = name.lastIndexOf('.');
+                    String pkg = ((n == -1) ? "" : name.substring(0, n + 1));
+                    if (proxyPkg == null) {
+                        proxyPkg = pkg;
+                    } else if (!pkg.equals(proxyPkg)) {
+                        throw new IllegalArgumentException(
+                            "non-public interfaces from different packages");
+                    }
+                }
+            }
+
+            if (proxyPkg == null) {
+                // 如果是公共接口，则用com.sun.proxy包
+                proxyPkg = ReflectUtil.PROXY_PACKAGE + ".";
+            }
+
+            /*
+             * 为代理类生成名字，规则 包名+前缀+数字 例：com.sun.proxy.$Proxy0
+             */
+            long num = nextUniqueNumber.getAndIncrement();
+            String proxyName = proxyPkg + proxyClassNamePrefix + num;
+
+            //生成代理类的二进制文件
+            byte[] proxyClassFile = ProxyGenerator.generateProxyClass(
+                proxyName, interfaces, accessFlags);
+            try {
+                //动态生成代理类，这就是最后一步了，由于是native方法，所以就无法向下追究了
+                return defineClass0(loader, proxyName,
+                                    proxyClassFile, 0, proxyClassFile.length);
+            } catch (ClassFormatError e) {
+                /*
+                 * A ClassFormatError here means that (barring bugs in the
+                 * proxy class generation code) there was some other
+                 * invalid aspect of the arguments supplied to the proxy
+                 * class creation (such as virtual machine limitations
+                 * exceeded).
+                 */
+                throw new IllegalArgumentException(e.toString());
+            }
+        }
+    }
+```
+
+接下来我们看一下具体是怎么获取代理类的二进制文件
+
+```java
+ProxyGenerator.generateProxyClass(
+                proxyName, interfaces, accessFlags);
+```
+
+```java
+  public static byte[] generateProxyClass(final String var0, Class<?>[] var1, int var2) {
+        ProxyGenerator var3 = new ProxyGenerator(var0, var1, var2);
+        final byte[] var4 = var3.generateClassFile();
+        //发现可以通过 saveGeneratedFiles参数来决定是否把代理类代存到本地
+        if (saveGeneratedFiles) {
+            AccessController.doPrivileged(new PrivilegedAction<Void>() {
+                public Void run() {
+                    try {
+                        int var1 = var0.lastIndexOf(46);
+                        Path var2;
+                        if (var1 > 0) {
+                            Path var3 = Paths.get(var0.substring(0, var1).replace('.', File.separatorChar));
+                            Files.createDirectories(var3);
+                            var2 = var3.resolve(var0.substring(var1 + 1, var0.length()) + ".class");
+                        } else {
+                            var2 = Paths.get(var0 + ".class");
+                        }
+
+                        //文件写入
+                        Files.write(var2, var4, new OpenOption[0]);
+                        return null;
+                    } catch (IOException var4x) {
+                        throw new InternalError("I/O exception saving generated file: " + var4x);
+                    }
+                }
+            });
+        }
+
+        return var4;
+    }
+```
+
+发现可以通过 **saveGeneratedFiles**参数来决定是否把代理类代存到本地，点击它来查看在哪进行设置
+
+```java
+    private static final boolean saveGeneratedFiles = (Boolean)AccessController.doPrivileged(new GetBooleanAction("sun.misc.ProxyGenerator.saveGeneratedFiles"));
+
+```
+
+我们可以把*sun.misc.ProxyGenerator.saveGeneratedFiles*这个属性设为true来把生成的类保存到本地，再运行，就会看到系统帮我们生成的代理类。以下为部分截取
+
+```java
+static {
         try {
             m1 = Class.forName("java.lang.Object").getMethod("equals", Class.forName("java.lang.Object"));
             m2 = Class.forName("java.lang.Object").getMethod("toString");
@@ -612,7 +842,7 @@ class Main {
 在初始化时，获得 method 备用。而这个代理类中所有方法的实现变为：
 
 ```java
-    public final void message(String var1) throws  {
+ public final void message(String var1) throws  {
         try {
             super.h.invoke(this, m3, new Object[]{var1});
         } catch (RuntimeException | Error var3) {
@@ -625,8 +855,29 @@ class Main {
 
 这里的 h 其实就是 InvocationHandler 接口，所以我们在使用动态代理时，传递的 InvocationHandler 就是一个监听，在代理对象上执行方法，都会由这个监听回调出来。
 
+最后用一张图作为总结
+
+![image](https://s2.loli.net/2022/05/10/UeFK5wI1dhJjqH8.png)
+
+**和Android提供的Proxy对比**
+
+```java
+        /*
+                 * Choose a name for the proxy class to generate.
+                 */
+                long num = nextUniqueNumber.getAndIncrement();
+                String proxyName = proxyPkg + proxyClassNamePrefix + num;
+
+                return generateProxy(proxyName, interfaces, loader, methodsArray,
+                                     exceptionsArray);
+            }
+```
+
+可以看到Android并没有通过**ProxyGenerator**生成代理类对象，而是直接交给native方法去处理。
+
 ### 静态代理和动态代理对比
 
 - 共同点：两种代理模式实现都在不改动基础对象的前提下，对基础对象进行访问控制和扩展，符合开闭原则。
 - 不同点：静态代理存在重复性和脆弱性的缺点；而动态代理（搭配泛型参数）可以实现了一个代理同时处理 N 种基础接口，一定程度上规避了静态代理的缺点。从原理上讲，静态代理的代理类 Class 文件在编译期生成，而动态代理的代理类 Class 文件在运行时生成，代理类在 coding 阶段并不存在，代理关系直到运行时才确定。
+
 
